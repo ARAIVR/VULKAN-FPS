@@ -1,4 +1,4 @@
-﻿// ======================= main.cpp (ECS fixed, full) =======================
+﻿// ======================= main.cpp (ECS + morphs) =======================
 #define _CRT_SECURE_NO_WARNINGS
 
 #include <vulkan/vulkan.hpp>
@@ -78,6 +78,11 @@ vk::DeviceMemory gVertexMemory;
 vk::Buffer       gIndexBuffer;
 vk::DeviceMemory gIndexMemory;
 
+// Morph vertex buffer (dynamic, CPU-updated each frame)
+vk::Buffer       gMorphVertexBuffer;
+vk::DeviceMemory gMorphVertexMemory;
+bool             gMorphBufferCreated = false;
+
 vk::CommandPool                 gCmdPool;
 std::vector<vk::CommandBuffer>  gCmdBuffers;
 
@@ -100,6 +105,37 @@ std::vector<Vertex>   gVertices;
 std::vector<uint32_t> gIndices;
 
 std::vector<Material> gMaterials;
+
+// ----------------------------------------------------------
+// Morph data (dummy.glb only)
+// ----------------------------------------------------------
+
+struct MorphTarget {
+    std::vector<glm::vec3> deltaPos;
+    std::vector<glm::vec3> deltaNormal;
+};
+
+struct MorphMesh {
+    uint32_t baseVertexOffset = 0;
+    uint32_t vertexCount = 0;
+    std::vector<MorphTarget> targets;
+};
+
+MorphMesh gDummyMorph;
+
+// Simple animation sampler for weights
+struct MorphAnimationSampler {
+    std::vector<float> times;                 // keyframe times
+    std::vector<std::vector<float>> weights;  // [key][targetIndex]
+};
+
+struct MorphAnimation {
+    MorphAnimationSampler sampler;
+    float duration = 0.0f;
+};
+
+MorphAnimation gMorphAnimation;
+float          gMorphTime = 0.0f;
 
 // ----------------------------------------------------------
 // Utility
@@ -321,7 +357,7 @@ void initWindow() {
 
     glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
     glfwWindowHint(GLFW_RESIZABLE, GLFW_FALSE);
-    gWindow = glfwCreateWindow(1280, 720, "Vulkan ECS", nullptr, nullptr);
+    gWindow = glfwCreateWindow(1280, 720, "Vulkan ECS Morphs", nullptr, nullptr);
 
     if (!gWindow)
         throw std::runtime_error("Failed to create window");
@@ -976,7 +1012,7 @@ LoadedImage loadImageFromCgltfImage(const cgltf_image* image, const char* gltfPa
 }
 
 // ----------------------------------------------------------
-// Minimal dummy.glb loader
+// Minimal dummy.glb loader with morph targets
 // ----------------------------------------------------------
 
 struct GLTFLoadedMesh {
@@ -1078,6 +1114,82 @@ GLTFLoadedMesh loadDummyGLB(const char* path, uint32_t& outMaterialID) {
     outMaterialID = (uint32_t)gMaterials.size();
     gMaterials.push_back(Material{ texView, texSampler });
 
+    // --------- Morph targets (POSITION / NORMAL deltas) ----------
+    gDummyMorph.baseVertexOffset = baseV;
+    gDummyMorph.vertexCount = (uint32_t)vCount;
+    gDummyMorph.targets.clear();
+
+    if (prim.targets_count > 0) {
+        gDummyMorph.targets.resize(prim.targets_count);
+        for (size_t t = 0; t < prim.targets_count; ++t) {
+            MorphTarget& mt = gDummyMorph.targets[t];
+            mt.deltaPos.resize(vCount, glm::vec3(0.0f));
+            mt.deltaNormal.resize(vCount, glm::vec3(0.0f));
+
+            cgltf_accessor* posDeltaAcc = nullptr;
+            cgltf_accessor* normDeltaAcc = nullptr;
+
+            for (size_t a = 0; a < prim.targets[t].attributes_count; ++a) {
+                cgltf_attribute& ta = prim.targets[t].attributes[a];
+                if (ta.type == cgltf_attribute_type_position) posDeltaAcc = ta.data;
+                if (ta.type == cgltf_attribute_type_normal)   normDeltaAcc = ta.data;
+            }
+
+            if (posDeltaAcc) {
+                for (size_t i = 0; i < vCount; ++i) {
+                    mt.deltaPos[i] = readVec3(posDeltaAcc, i);
+                }
+            }
+            if (normDeltaAcc) {
+                for (size_t i = 0; i < vCount; ++i) {
+                    mt.deltaNormal[i] = readVec3(normDeltaAcc, i);
+                }
+            }
+        }
+    }
+
+    // --------- Animation (WEIGHTS) ----------
+    gMorphAnimation = MorphAnimation{};
+    if (data->animations_count > 0 && prim.targets_count > 0) {
+        cgltf_animation& anim = data->animations[0];
+
+        for (size_t c = 0; c < anim.channels_count; ++c) {
+            cgltf_animation_channel& ch = anim.channels[c];
+            if (!ch.target_node || !ch.sampler) continue;
+            if (ch.target_path != cgltf_animation_path_type_weights) continue;
+            if (!ch.target_node->mesh || ch.target_node->mesh != &mesh) continue;
+
+            cgltf_animation_sampler* s = ch.sampler;
+            cgltf_accessor* inAcc = s->input;
+            cgltf_accessor* outAcc = s->output;
+            if (!inAcc || !outAcc) continue;
+
+            size_t keyCount = inAcc->count;
+            gMorphAnimation.sampler.times.resize(keyCount);
+            gMorphAnimation.sampler.weights.resize(keyCount);
+
+            // times
+            for (size_t k = 0; k < keyCount; ++k) {
+                cgltf_float tmp[4];
+                cgltf_accessor_read_float(inAcc, k, tmp, 4);
+                gMorphAnimation.sampler.times[k] = tmp[0];
+            }
+
+            // weights: outAcc has keyCount * targetCount floats
+            size_t targetCount = prim.targets_count;
+            for (size_t k = 0; k < keyCount; ++k) {
+                std::vector<float> w(targetCount, 0.0f);
+                cgltf_accessor_read_float(outAcc, k * targetCount, w.data(), (cgltf_size)targetCount);
+                gMorphAnimation.sampler.weights[k] = std::move(w);
+            }
+
+            if (keyCount > 0) {
+                gMorphAnimation.duration = gMorphAnimation.sampler.times.back();
+            }
+            break;
+        }
+    }
+
     GLTFLoadedMesh result{};
     result.vertexOffset = baseV;
     result.indexOffset = baseI;
@@ -1085,6 +1197,119 @@ GLTFLoadedMesh loadDummyGLB(const char* path, uint32_t& outMaterialID) {
 
     cgltf_free(data);
     return result;
+}
+
+// ----------------------------------------------------------
+// Morph buffer + animation update
+// ----------------------------------------------------------
+
+void createMorphVertexBufferIfNeeded() {
+    if (gMorphBufferCreated) return;
+    if (gVertices.empty()) return;
+
+    vk::DeviceSize size = sizeof(Vertex) * gVertices.size();
+    createBuffer(
+        size,
+        vk::BufferUsageFlagBits::eVertexBuffer,
+        vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent,
+        gMorphVertexBuffer,
+        gMorphVertexMemory
+    );
+
+    void* data = gDevice.mapMemory(gMorphVertexMemory, 0, size);
+    std::memcpy(data, gVertices.data(), (size_t)size);
+    gDevice.unmapMemory(gMorphVertexMemory);
+
+    gMorphBufferCreated = true;
+}
+
+void evaluateMorphAnimation(float time, std::vector<float>& outWeights) {
+    outWeights.clear();
+    if (gMorphAnimation.sampler.times.empty() ||
+        gMorphAnimation.sampler.weights.empty() ||
+        gMorphAnimation.duration <= 0.0f) {
+        return;
+    }
+
+    float t = std::fmod(time, gMorphAnimation.duration);
+    auto& times = gMorphAnimation.sampler.times;
+    auto& weights = gMorphAnimation.sampler.weights;
+
+    size_t count = times.size();
+    if (count == 1) {
+        outWeights = weights[0];
+        return;
+    }
+
+    size_t i1 = 0;
+    while (i1 < count && times[i1] < t) ++i1;
+    if (i1 == 0) {
+        outWeights = weights[0];
+        return;
+    }
+    if (i1 >= count) {
+        outWeights = weights[count - 1];
+        return;
+    }
+
+    size_t i0 = i1 - 1;
+    float t0 = times[i0];
+    float t1 = times[i1];
+    float alpha = (t1 > t0) ? (t - t0) / (t1 - t0) : 0.0f;
+
+    auto& w0 = weights[i0];
+    auto& w1 = weights[i1];
+    size_t n = std::min(w0.size(), w1.size());
+    outWeights.resize(n);
+    for (size_t i = 0; i < n; ++i) {
+        outWeights[i] = (1.0f - alpha) * w0[i] + alpha * w1[i];
+    }
+}
+
+void updateMorphMeshes(float dt) {
+    gMorphTime += dt;
+
+    if (gDummyMorph.vertexCount == 0 || gDummyMorph.targets.empty())
+        return;
+
+    createMorphVertexBufferIfNeeded();
+    if (!gMorphBufferCreated) return;
+
+    // Start from base geometry
+    std::vector<Vertex> morphed = gVertices;
+
+    // Evaluate animation weights
+    std::vector<float> animWeights;
+    evaluateMorphAnimation(gMorphTime, animWeights);
+
+    size_t targetCount = gDummyMorph.targets.size();
+    if (animWeights.size() < targetCount) {
+        animWeights.resize(targetCount, 0.0f);
+    }
+
+    uint32_t base = gDummyMorph.baseVertexOffset;
+    uint32_t vCount = gDummyMorph.vertexCount;
+
+    for (uint32_t i = 0; i < vCount; ++i) {
+        Vertex v = gVertices[base + i];
+        glm::vec3 pos = v.pos;
+        glm::vec3 nrm = v.normal;
+
+        for (size_t t = 0; t < targetCount; ++t) {
+            float w = animWeights[t];
+            if (w == 0.0f) continue;
+            pos += gDummyMorph.targets[t].deltaPos[i] * w;
+            nrm += gDummyMorph.targets[t].deltaNormal[i] * w;
+        }
+
+        if (glm::length(nrm) > 0.0001f) nrm = glm::normalize(nrm);
+        morphed[base + i] = { pos, nrm, v.uv };
+    }
+
+    vk::DeviceSize size = sizeof(Vertex) * morphed.size();
+    void* data = gDevice.mapMemory(gMorphVertexMemory, 0, size);
+    std::memcpy(data, morphed.data(), (size_t)size);
+    gDevice.unmapMemory(gMorphVertexMemory);
 }
 
 // ----------------------------------------------------------
@@ -1191,11 +1416,11 @@ int main() {
         comps.meshes.add(cubeE, cubeM);
         comps.materials.add(cubeE, cubeMat);
 
-        // dummy.glb entity (its own texture) -- use small scale and position similar to working main
+        // dummy.glb entity (its own texture, morphed)
         Entity dummyE = ecsCreateEntity(reg);
         TransformComponent dummyT{};
-        dummyT.position = glm::vec3(0.0f, 5.0f, 0.0f);   // place above ground
-        dummyT.scale = glm::vec3(0.01f, 0.01f, 0.01f);   // scale down to match glTF units
+        dummyT.position = glm::vec3(0.0f, 5.0f, 0.0f);   // above ground
+        dummyT.scale = glm::vec3(0.01f, 0.01f, 0.01f);   // glTF units
         MeshComponent dummyMC{};
         dummyMC.vertexOffset = dummyMesh.vertexOffset;
         dummyMC.indexOffset = dummyMesh.indexOffset;
@@ -1218,6 +1443,7 @@ int main() {
             gLastFrameTime = now;
 
             updateInputSystem(reg, comps, dt);
+            updateMorphMeshes(dt);      // morph dummy.glb on CPU, upload to GPU
             renderFrame(reg, comps);
         }
 
@@ -1225,6 +1451,11 @@ int main() {
         std::cout << "Shutdown clean.\n";
 
         // Cleanup
+        if (gMorphBufferCreated) {
+            gDevice.destroyBuffer(gMorphVertexBuffer);
+            gDevice.freeMemory(gMorphVertexMemory);
+        }
+
         gDevice.destroyFence(gInFlight);
         gDevice.destroySemaphore(gRenderFinished);
         gDevice.destroySemaphore(gImgAvailable);
@@ -1280,3 +1511,4 @@ int main() {
 
     return 0;
 }
+//new

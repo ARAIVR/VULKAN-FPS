@@ -41,6 +41,10 @@ extern std::vector<vk::DescriptorSet> gGlobalDescSets;
 extern vk::Buffer       gVertexBuffer;
 extern vk::Buffer       gIndexBuffer;
 
+// NEW: morph vertex buffer (used if created)
+extern vk::Buffer gMorphVertexBuffer;
+extern bool       gMorphBufferCreated;
+
 // ==========================================================
 //  GLOBAL UBO
 // ==========================================================
@@ -120,11 +124,11 @@ inline void updateInputSystem(
             rx = applyDead(rx);
             ry = applyDead(ry);
 
-            // Movement: left stick (match previous behavior)
+            // Movement: left stick
             move.x += lx;
             move.z -= ly;
 
-            // Look: right stick scaled by sensitivity and dt (match non-ECS code)
+            // Look: right stick scaled by sensitivity and dt
             float lookScale = c->sensitivity * 100.0f * dt;
             c->yaw += rx * lookScale;
             c->pitch -= ry * lookScale;
@@ -184,7 +188,10 @@ inline void recordCommandBuffer(
     cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, gPipeline);
 
     vk::DeviceSize offsets[] = { 0 };
-    cmd.bindVertexBuffers(0, 1, &gVertexBuffer, offsets);
+
+    // Use morph buffer if it exists, otherwise the static vertex buffer
+    vk::Buffer vb = gMorphBufferCreated ? gMorphVertexBuffer : gVertexBuffer;
+    cmd.bindVertexBuffers(0, 1, &vb, offsets);
     cmd.bindIndexBuffer(gIndexBuffer, 0, vk::IndexType::eUint32);
 
     // Update UBO from camera component
@@ -301,3 +308,4 @@ inline void renderFrame(
 
     gGraphicsQueue.presentKHR(present);
 }
+//new
