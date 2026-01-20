@@ -8,15 +8,7 @@ A Vulkan-based first-person shooter framework/prototype written in modern C++.
 
 Uses an ECS architecture (entities, components, systems).
 
-🛠️ Build & run instructions
-
-Required tools (Vulkan SDK, CMake, compiler).
-
-Dependencies (if any: GLFW, Vulkan-Hpp, etc).
-
-How to compile & launch.
-
-🚀 Features
+GLFW + VULKAN 
 
 ECS structure
 
