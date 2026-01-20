@@ -17,3 +17,6 @@ Vulkan renderer
 glTF model loading
 
 PBR shaders
+Non-Trivial Vulkan C++ AI generated ECS structured open source code
+https://www.scribd.com/document/978223162/VICTORY-IS-IN-THE-GRAVE-AI-ENGINE
+https://www.scribd.com/document/983949945/AI-coded-C-ECS-VULKAN-GLFW-GPU-GLB-Loader-FPS-Game-Engine
