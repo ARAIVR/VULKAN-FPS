@@ -1,6 +1,5 @@
-
-// ======================= main.cpp  PART 1/9 =======================
-// Includes, globals, camera, math helpers, utility, one-shot commands, texture upload, morph structs
+﻿// ======================= main.cpp (ECS fixed, full) =======================
+#define _CRT_SECURE_NO_WARNINGS
 
 #include <vulkan/vulkan.hpp>
 #include <GLFW/glfw3.h>
@@ -24,10 +23,14 @@
 #include <cassert>
 
 #include "cgltf.h"
-#include "tinygltf/stb_image.h"   // STB implementation is in stb.cpp
+#include "tinygltf/stb_image.h"
+
+#include "ECS.hpp"
+#include "Components.hpp"
+#include "Systems.hpp"
 
 // ----------------------------------------------------------
-// Globals
+// Globals (matching externs in Systems.hpp)
 // ----------------------------------------------------------
 
 GLFWwindow* gWindow = nullptr;
@@ -55,24 +58,21 @@ vk::DescriptorSetLayout          gDescSetLayout;
 vk::DescriptorPool               gDescPool;
 std::vector<vk::DescriptorSet>   gGlobalDescSets;
 
-// Depth buffer
 vk::Image        gDepthImage;
 vk::DeviceMemory gDepthMemory;
 vk::ImageView    gDepthView;
 vk::Format       gDepthFormat = vk::Format::eD32Sfloat;
 
-// Textures
 vk::Image        gPlaneTexImage;
 vk::DeviceMemory gPlaneTexMemory;
 vk::ImageView    gPlaneTexView;
 vk::Sampler      gPlaneTexSampler;
 
-vk::Image        gModelTexImage;
-vk::DeviceMemory gModelTexMemory;
-vk::ImageView    gModelTexView;
-vk::Sampler      gModelTexSampler;
+vk::Image        gDummyTexImage;
+vk::DeviceMemory gDummyTexMemory;
+vk::ImageView    gDummyTexView;
+vk::Sampler      gDummyTexSampler;
 
-// Shared buffers
 vk::Buffer       gVertexBuffer;
 vk::DeviceMemory gVertexMemory;
 vk::Buffer       gIndexBuffer;
@@ -85,74 +85,10 @@ vk::Semaphore       gImgAvailable;
 vk::Semaphore       gRenderFinished;
 vk::Fence           gInFlight;
 
-// UBO per swapchain image
-struct GlobalUBO {
-    glm::mat4 view;
-    glm::mat4 proj;
-    glm::vec4 lightDir;
-    glm::vec4 lightColor;
-};
 std::vector<vk::Buffer>       gUBOs;
 std::vector<vk::DeviceMemory> gUBOMem;
 
 std::chrono::steady_clock::time_point gLastFrameTime;
-
-// ----------------------------------------------------------
-// Camera
-// ----------------------------------------------------------
-
-struct Camera {
-    glm::vec3 position{ 0.0f, 8.0f, -25.0f };
-    float pitch = -10.0f;
-    float yaw = 90.0f;
-    float speed = 5.0f;
-    float sensitivity = 0.1f;
-
-    glm::mat4 getView() const {
-        glm::vec3 front;
-        front.x = cos(glm::radians(yaw)) * cos(glm::radians(pitch));
-        front.y = sin(glm::radians(pitch));
-        front.z = sin(glm::radians(yaw)) * cos(glm::radians(pitch));
-        glm::vec3 dir = glm::normalize(front);
-        return glm::lookAt(position, position + dir, { 0.0f, 1.0f, 0.0f });
-    }
-};
-
-Camera gCamera;
-double gLastX = 400.0, gLastY = 300.0;
-bool   gFirstMouse = true;
-
-// ----------------------------------------------------------
-// Transforms
-// ----------------------------------------------------------
-
-struct ObjectTransform {
-    glm::vec3 position = glm::vec3(0.0f);
-    glm::quat rotation = glm::quat(1.0f, 0.0f, 0.0f, 0.0f);
-    glm::vec3 scale = glm::vec3(1.0f);
-
-    glm::mat4 toMatrix() const {
-        glm::mat4 T = glm::translate(glm::mat4(1.0f), position);
-        glm::mat4 R = glm::mat4_cast(rotation);
-        glm::mat4 S = glm::scale(glm::mat4(1.0f), scale);
-        return T * R * S;
-    }
-};
-
-// ----------------------------------------------------------
-// Push constants
-// ----------------------------------------------------------
-
-struct PushConstants {
-    glm::mat4 model;
-    int   objectID;
-    float roughnessOverride;
-    float metallicOverride;
-};
-
-// ----------------------------------------------------------
-// Vertex / Mesh
-// ----------------------------------------------------------
 
 struct Vertex {
     glm::vec3 pos;
@@ -163,89 +99,7 @@ struct Vertex {
 std::vector<Vertex>   gVertices;
 std::vector<uint32_t> gIndices;
 
-// ----------------------------------------------------------
-// Object registry
-// ----------------------------------------------------------
-
-struct RenderObject {
-    uint32_t vertexOffset;
-    uint32_t indexOffset;
-    uint32_t indexCount;
-    uint32_t materialID;
-    ObjectTransform transform;
-};
-
-std::vector<RenderObject> gObjects;
-
-// ----------------------------------------------------------
-// Materials
-// ----------------------------------------------------------
-
-struct Material {
-    vk::ImageView view;
-    vk::Sampler   sampler;
-};
-
 std::vector<Material> gMaterials;
-
-// ----------------------------------------------------------
-// Loaded image (CPU-side RGBA)
-// ----------------------------------------------------------
-
-struct LoadedImage {
-    int width = 0;
-    int height = 0;
-    std::vector<unsigned char> pixels; // RGBA8
-};
-
-// ----------------------------------------------------------
-// Morphing structures (from glTF morph targets + animation)
-// ----------------------------------------------------------
-
-// Morph target: per-vertex delta from base mesh
-struct MorphTarget {
-    std::vector<glm::vec3> deltaPos;
-    std::vector<glm::vec3> deltaNormal;
-};
-//start
-// One morphable mesh instance
-struct MorphMesh {
-    uint32_t baseVertexOffset;   // into gVertices
-    uint32_t vertexCount;        // number of vertices in this morphable mesh
-
-    // CPU-side base copy for morphing
-    std::vector<Vertex> baseVertices;
-
-    // Morph targets (from glTF)
-    std::vector<MorphTarget> targets;
-
-    // Active weights (same size as targets)
-    std::vector<float> weights;
-};
-
-// Global morph registry
-std::vector<MorphMesh> gMorphMeshes;
-
-// Dynamic vertex buffer for morphed vertices
-vk::Buffer       gMorphVertexBuffer;
-vk::DeviceMemory gMorphVertexMemory;
-bool             gMorphBufferCreated = false;
-
-// ----------------------------------------------------------
-// glTF morph animation (weights over time)
-// ----------------------------------------------------------
-
-struct MorphAnimationSampler {
-    std::vector<float> times;                 // keyframe times
-    std::vector<std::vector<float>> weights;  // per keyframe: weights for all targets
-};
-
-struct MorphAnimation {
-    MorphAnimationSampler sampler;
-    float duration = 0.0f;
-};
-
-MorphAnimation gMorphAnimation;   // single clip for now
 
 // ----------------------------------------------------------
 // Utility
@@ -278,11 +132,13 @@ uint32_t findMemoryType(uint32_t bits, vk::MemoryPropertyFlags props) {
     throw std::runtime_error("No suitable memory type");
 }
 
-void createBuffer(vk::DeviceSize size,
+void createBuffer(
+    vk::DeviceSize size,
     vk::BufferUsageFlags usage,
     vk::MemoryPropertyFlags props,
     vk::Buffer& buf,
-    vk::DeviceMemory& mem) {
+    vk::DeviceMemory& mem
+) {
     vk::BufferCreateInfo bi({}, size, usage, vk::SharingMode::eExclusive);
     buf = gDevice.createBuffer(bi);
     auto req = gDevice.getBufferMemoryRequirements(buf);
@@ -290,10 +146,6 @@ void createBuffer(vk::DeviceSize size,
     mem = gDevice.allocateMemory(ai);
     gDevice.bindBufferMemory(buf, mem, 0);
 }
-
-// ----------------------------------------------------------
-// One-shot command helpers
-// ----------------------------------------------------------
 
 vk::CommandBuffer beginSingleTimeCommands() {
     vk::CommandBufferAllocateInfo allocInfo{};
@@ -319,9 +171,11 @@ void endSingleTimeCommands(vk::CommandBuffer cmd) {
     gDevice.freeCommandBuffers(gCmdPool, cmd);
 }
 
-// ----------------------------------------------------------
-// Texture upload: LoadedImage -> GPU image + sampler
-// ----------------------------------------------------------
+struct LoadedImage {
+    int width = 0;
+    int height = 0;
+    std::vector<unsigned char> pixels;
+};
 
 void createVulkanTextureFromRGBA(
     const LoadedImage& img,
@@ -332,7 +186,6 @@ void createVulkanTextureFromRGBA(
 ) {
     vk::DeviceSize imageSize = (vk::DeviceSize)(img.width * img.height * 4);
 
-    // Staging buffer
     vk::Buffer stagingBuffer;
     vk::DeviceMemory stagingMemory;
     createBuffer(
@@ -347,7 +200,6 @@ void createVulkanTextureFromRGBA(
     std::memcpy(data, img.pixels.data(), (size_t)imageSize);
     gDevice.unmapMemory(stagingMemory);
 
-    // GPU image
     vk::ImageCreateInfo ici{};
     ici.imageType = vk::ImageType::e2D;
     ici.format = vk::Format::eR8G8B8A8Unorm;
@@ -373,7 +225,6 @@ void createVulkanTextureFromRGBA(
     outMemory = gDevice.allocateMemory(ai);
     gDevice.bindImageMemory(outImage, outMemory, 0);
 
-    // Layout transitions + copy
     vk::CommandBuffer cmd = beginSingleTimeCommands();
 
     vk::ImageMemoryBarrier barrier{};
@@ -386,7 +237,6 @@ void createVulkanTextureFromRGBA(
     barrier.subresourceRange.baseArrayLayer = 0;
     barrier.subresourceRange.layerCount = 1;
 
-    // undefined -> transfer dst
     barrier.oldLayout = vk::ImageLayout::eUndefined;
     barrier.newLayout = vk::ImageLayout::eTransferDstOptimal;
     barrier.srcAccessMask = {};
@@ -416,7 +266,6 @@ void createVulkanTextureFromRGBA(
         &copy
     );
 
-    // transfer dst -> shader read
     barrier.oldLayout = vk::ImageLayout::eTransferDstOptimal;
     barrier.newLayout = vk::ImageLayout::eShaderReadOnlyOptimal;
     barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
@@ -435,7 +284,6 @@ void createVulkanTextureFromRGBA(
     gDevice.destroyBuffer(stagingBuffer);
     gDevice.freeMemory(stagingMemory);
 
-    // Image view
     vk::ImageViewCreateInfo vi{};
     vi.image = outImage;
     vi.viewType = vk::ImageViewType::e2D;
@@ -448,7 +296,6 @@ void createVulkanTextureFromRGBA(
 
     outView = gDevice.createImageView(vi);
 
-    // Sampler
     vk::SamplerCreateInfo si{};
     si.magFilter = vk::Filter::eLinear;
     si.minFilter = vk::Filter::eLinear;
@@ -463,15 +310,18 @@ void createVulkanTextureFromRGBA(
 
     outSampler = gDevice.createSampler(si);
 }
-// ======================= main.cpp  PART 2/9 =======================
-// Vulkan instance, surface, GPU selection, logical device
+
+// ----------------------------------------------------------
+// Vulkan setup (window, instance, device, swapchain, etc.)
+// ----------------------------------------------------------
 
 void initWindow() {
     if (!glfwInit())
         throw std::runtime_error("GLFW init failed");
 
     glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
-    gWindow = glfwCreateWindow(1280, 720, "Vulkan Engine", nullptr, nullptr);
+    glfwWindowHint(GLFW_RESIZABLE, GLFW_FALSE);
+    gWindow = glfwCreateWindow(1280, 720, "Vulkan ECS", nullptr, nullptr);
 
     if (!gWindow)
         throw std::runtime_error("Failed to create window");
@@ -479,7 +329,7 @@ void initWindow() {
 
 void createInstance() {
     vk::ApplicationInfo appInfo(
-        "Vulkan Engine", 1,
+        "Vulkan ECS", 1,
         "None", 1,
         VK_API_VERSION_1_3
     );
@@ -553,13 +403,10 @@ void createDevice() {
     gDevice = gGPU.createDevice(dci);
     gGraphicsQueue = gDevice.getQueue(gGraphicsQueueFamily, 0);
 }
-// ======================= main.cpp  PART 3/9 =======================
-// Swapchain, depth buffer, render pass, framebuffers
 
 void createSwapchain() {
     auto caps = gGPU.getSurfaceCapabilitiesKHR(gSurface);
     auto fmts = gGPU.getSurfaceFormatsKHR(gSurface);
-    auto modes = gGPU.getSurfacePresentModesKHR(gSurface);
 
     if (fmts.empty())
         throw std::runtime_error("No surface formats available");
@@ -694,8 +541,6 @@ void createFramebuffers() {
         gFramebuffers[i] = gDevice.createFramebuffer(fb);
     }
 }
-// ======================= main.cpp  PART 4/9 =======================
-// Descriptor layouts, pipeline layout, graphics pipeline
 
 void createDescriptorSetLayout() {
     std::array<vk::DescriptorSetLayoutBinding, 2> bindings{};
@@ -718,6 +563,13 @@ void createDescriptorSetLayout() {
 
     gDescSetLayout = gDevice.createDescriptorSetLayout(ci);
 }
+
+struct PushConstants {
+    glm::mat4 model;
+    int   objectID;
+    float roughnessOverride;
+    float metallicOverride;
+};
 
 void createPipelineLayout() {
     vk::PushConstantRange pcRange{};
@@ -839,8 +691,10 @@ void createPipeline() {
     gDevice.destroyShaderModule(vert);
     gDevice.destroyShaderModule(frag);
 }
-// ======================= main.cpp  PART 5/9 =======================
-// Command pool, geometry (plane, cube, glTF), morph setup from glTF, shared buffers
+
+// ----------------------------------------------------------
+// Command pool, buffers, sync, UBOs, descriptors
+// ----------------------------------------------------------
 
 void createCommandPool() {
     vk::CommandPoolCreateInfo ci{};
@@ -849,16 +703,119 @@ void createCommandPool() {
     gCmdPool = gDevice.createCommandPool(ci);
 }
 
-void addPlaneAndCubeGeometry() {
+void allocateCommandBuffers() {
+    gCmdBuffers.resize(gSwapImages.size());
+    vk::CommandBufferAllocateInfo ai{};
+    ai.commandPool = gCmdPool;
+    ai.level = vk::CommandBufferLevel::ePrimary;
+    ai.commandBufferCount = (uint32_t)gCmdBuffers.size();
+    gCmdBuffers = gDevice.allocateCommandBuffers(ai);
+}
+
+void createSyncObjects() {
+    vk::SemaphoreCreateInfo si{};
+    gImgAvailable = gDevice.createSemaphore(si);
+    gRenderFinished = gDevice.createSemaphore(si);
+
+    vk::FenceCreateInfo fi{};
+    fi.flags = vk::FenceCreateFlagBits::eSignaled;
+    gInFlight = gDevice.createFence(fi);
+}
+
+void createUBOs() {
+    gUBOs.resize(gSwapImages.size());
+    gUBOMem.resize(gSwapImages.size());
+
+    for (size_t i = 0; i < gUBOs.size(); ++i) {
+        createBuffer(
+            sizeof(GlobalUBO),
+            vk::BufferUsageFlagBits::eUniformBuffer,
+            vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent,
+            gUBOs[i],
+            gUBOMem[i]
+        );
+    }
+}
+
+void createDescriptorPoolAndSets() {
+    std::array<vk::DescriptorPoolSize, 2> sizes{};
+    sizes[0].type = vk::DescriptorType::eUniformBuffer;
+    sizes[0].descriptorCount = (uint32_t)gSwapImages.size();
+    sizes[1].type = vk::DescriptorType::eCombinedImageSampler;
+    sizes[1].descriptorCount = (uint32_t)gSwapImages.size();
+
+    vk::DescriptorPoolCreateInfo pi{};
+    pi.maxSets = (uint32_t)gSwapImages.size();
+    pi.poolSizeCount = (uint32_t)sizes.size();
+    pi.pPoolSizes = sizes.data();
+
+    gDescPool = gDevice.createDescriptorPool(pi);
+
+    std::vector<vk::DescriptorSetLayout> layouts(gSwapImages.size(), gDescSetLayout);
+    vk::DescriptorSetAllocateInfo ai{};
+    ai.descriptorPool = gDescPool;
+    ai.descriptorSetCount = (uint32_t)layouts.size();
+    ai.pSetLayouts = layouts.data();
+
+    gGlobalDescSets = gDevice.allocateDescriptorSets(ai);
+}
+
+void initUBODescriptorSets() {
+    for (size_t i = 0; i < gGlobalDescSets.size(); ++i) {
+        vk::DescriptorBufferInfo bi{};
+        bi.buffer = gUBOs[i];
+        bi.offset = 0;
+        bi.range = sizeof(GlobalUBO);
+
+        vk::WriteDescriptorSet write{};
+        write.dstSet = gGlobalDescSets[i];
+        write.dstBinding = 0;
+        write.descriptorType = vk::DescriptorType::eUniformBuffer;
+        write.descriptorCount = 1;
+        write.pBufferInfo = &bi;
+
+        gDevice.updateDescriptorSets(1, &write, 0, nullptr);
+    }
+}
+
+void bindMaterialForDraw(uint32_t imageIndex, uint32_t materialID) {
+    if (materialID >= gMaterials.size()) return;
+    Material& mat = gMaterials[materialID];
+
+    vk::DescriptorImageInfo ii{};
+    ii.imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal;
+    ii.imageView = mat.view;
+    ii.sampler = mat.sampler;
+
+    vk::WriteDescriptorSet write{};
+    write.dstSet = gGlobalDescSets[imageIndex];
+    write.dstBinding = 1;
+    write.descriptorType = vk::DescriptorType::eCombinedImageSampler;
+    write.descriptorCount = 1;
+    write.pImageInfo = &ii;
+
+    gDevice.updateDescriptorSets(1, &write, 0, nullptr);
+}
+
+// ----------------------------------------------------------
+// Geometry: plane + cube
+// ----------------------------------------------------------
+
+struct MeshRange {
+    uint32_t vertexOffset;
+    uint32_t indexOffset;
+    uint32_t indexCount;
+};
+
+void addPlaneAndCubeGeometry(MeshRange& outPlane, MeshRange& outCube) {
     gVertices.clear();
     gIndices.clear();
-    gObjects.clear();
 
     float groundHalf = 50.0f;
     float groundUV = 10.0f;
 
-    uint32_t baseV = (uint32_t)gVertices.size();
-    uint32_t baseI = (uint32_t)gIndices.size();
+    outPlane.vertexOffset = (uint32_t)gVertices.size();
+    outPlane.indexOffset = (uint32_t)gIndices.size();
 
     gVertices.push_back({ { -groundHalf, 0, -groundHalf }, {0,1,0}, {0,0} });
     gVertices.push_back({ {  groundHalf, 0, -groundHalf }, {0,1,0}, {groundUV,0} });
@@ -866,18 +823,11 @@ void addPlaneAndCubeGeometry() {
     gVertices.push_back({ { -groundHalf, 0,  groundHalf }, {0,1,0}, {0,groundUV} });
 
     gIndices.insert(gIndices.end(), {
-        baseV + 0, baseV + 3, baseV + 2,
-        baseV + 2, baseV + 1, baseV + 0
+        outPlane.vertexOffset + 0, outPlane.vertexOffset + 3, outPlane.vertexOffset + 2,
+        outPlane.vertexOffset + 2, outPlane.vertexOffset + 1, outPlane.vertexOffset + 0
         });
 
-    RenderObject ground{};
-    ground.vertexOffset = baseV;
-    ground.indexOffset = baseI;
-    ground.indexCount = 6;
-    ground.materialID = 0;
-    ground.transform.position = { 0,0,0 };
-    ground.transform.scale = { 1,1,1 };
-    gObjects.push_back(ground);
+    outPlane.indexCount = 6;
 
     auto addFace = [&](glm::vec3 v0, glm::vec3 v1, glm::vec3 v2, glm::vec3 v3, glm::vec3 n) {
         uint32_t start = (uint32_t)gVertices.size();
@@ -892,6 +842,9 @@ void addPlaneAndCubeGeometry() {
             });
         };
 
+    outCube.vertexOffset = (uint32_t)gVertices.size();
+    outCube.indexOffset = (uint32_t)gIndices.size();
+
     float h = 5.0f;
     float y0 = 0.0f;
     float y1 = 10.0f;
@@ -903,920 +856,427 @@ void addPlaneAndCubeGeometry() {
     addFace({ -h,y0,h }, { h,y0,h }, { h,y1,h }, { -h,y1,h }, { 0,0,1 });
     addFace({ h,y0,-h }, { -h,y0,-h }, { -h,y1,-h }, { h,y1,-h }, { 0,0,-1 });
 
-    RenderObject cube{};
-    cube.vertexOffset = baseV + 4;
-    cube.indexOffset = baseI + 6;
-    cube.indexCount = (uint32_t)gIndices.size() - cube.indexOffset;
-    cube.materialID = 0;
-    cube.transform.position = { 0,0,0 };
-    cube.transform.scale = { 1,1,1 };
-    gObjects.push_back(cube);
+    outCube.indexCount = (uint32_t)gIndices.size() - outCube.indexOffset;
 }
 
-// Temporary storage for model vertices/indices
-std::vector<Vertex>   gModelVertices;
-std::vector<uint32_t> gModelIndices;
-//start cut 
-// Load glTF model, including morph targets and morph animation
-void loadGLTFModel(const char* path) {
+void uploadSharedBuffers() {
+    vk::DeviceSize vSize = sizeof(Vertex) * gVertices.size();
+    vk::DeviceSize iSize = sizeof(uint32_t) * gIndices.size();
+
+    vk::Buffer stagingV;
+    vk::DeviceMemory stagingVMem;
+    createBuffer(
+        vSize,
+        vk::BufferUsageFlagBits::eTransferSrc,
+        vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent,
+        stagingV,
+        stagingVMem
+    );
+
+    void* data = gDevice.mapMemory(stagingVMem, 0, vSize);
+    std::memcpy(data, gVertices.data(), (size_t)vSize);
+    gDevice.unmapMemory(stagingVMem);
+
+    vk::Buffer stagingI;
+    vk::DeviceMemory stagingIMem;
+    createBuffer(
+        iSize,
+        vk::BufferUsageFlagBits::eTransferSrc,
+        vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent,
+        stagingI,
+        stagingIMem
+    );
+
+    data = gDevice.mapMemory(stagingIMem, 0, iSize);
+    std::memcpy(data, gIndices.data(), (size_t)iSize);
+    gDevice.unmapMemory(stagingIMem);
+
+    createBuffer(
+        vSize,
+        vk::BufferUsageFlagBits::eVertexBuffer | vk::BufferUsageFlagBits::eTransferDst,
+        vk::MemoryPropertyFlagBits::eDeviceLocal,
+        gVertexBuffer,
+        gVertexMemory
+    );
+
+    createBuffer(
+        iSize,
+        vk::BufferUsageFlagBits::eIndexBuffer | vk::BufferUsageFlagBits::eTransferDst,
+        vk::MemoryPropertyFlagBits::eDeviceLocal,
+        gIndexBuffer,
+        gIndexMemory
+    );
+
+    vk::CommandBuffer cmd = beginSingleTimeCommands();
+
+    vk::BufferCopy copyV{};
+    copyV.size = vSize;
+    cmd.copyBuffer(stagingV, gVertexBuffer, 1, &copyV);
+
+    vk::BufferCopy copyI{};
+    copyI.size = iSize;
+    cmd.copyBuffer(stagingI, gIndexBuffer, 1, &copyI);
+
+    endSingleTimeCommands(cmd);
+
+    gDevice.destroyBuffer(stagingV);
+    gDevice.freeMemory(stagingVMem);
+    gDevice.destroyBuffer(stagingI);
+    gDevice.freeMemory(stagingIMem);
+}
+
+// ----------------------------------------------------------
+// Image loading helpers
+// ----------------------------------------------------------
+
+LoadedImage loadPNG(const char* path) {
+    LoadedImage img;
+    int comp = 0;
+    unsigned char* data = stbi_load(path, &img.width, &img.height, &comp, 4);
+    if (!data) throw std::runtime_error(std::string("Failed to load image: ") + path);
+    img.pixels.assign(data, data + img.width * img.height * 4);
+    stbi_image_free(data);
+    return img;
+}
+
+LoadedImage loadImageFromCgltfImage(const cgltf_image* image, const char* gltfPath) {
+    LoadedImage img;
+
+    if (image->uri && image->uri[0] != '\0') {
+        std::string base(gltfPath);
+        size_t slash = base.find_last_of("/\\");
+        std::string dir = (slash == std::string::npos) ? "" : base.substr(0, slash + 1);
+        std::string fullPath = dir + image->uri;
+        return loadPNG(fullPath.c_str());
+    }
+
+    if (image->buffer_view && image->buffer_view->buffer && image->buffer_view->buffer->data) {
+        const cgltf_buffer_view* bv = image->buffer_view;
+        const cgltf_buffer* buf = bv->buffer;
+        const unsigned char* base = static_cast<const unsigned char*>(buf->data);
+        const unsigned char* ptr = base + bv->offset;
+        int comp = 0;
+        unsigned char* data = stbi_load_from_memory(
+            ptr,
+            (int)bv->size,
+            &img.width,
+            &img.height,
+            &comp,
+            4
+        );
+        if (!data) {
+            throw std::runtime_error("Failed to load embedded image from glb");
+        }
+        img.pixels.assign(data, data + img.width * img.height * 4);
+        stbi_image_free(data);
+        return img;
+    }
+
+    throw std::runtime_error("cgltf_image has no uri or buffer_view");
+}
+
+// ----------------------------------------------------------
+// Minimal dummy.glb loader
+// ----------------------------------------------------------
+
+struct GLTFLoadedMesh {
+    uint32_t vertexOffset;
+    uint32_t indexOffset;
+    uint32_t indexCount;
+};
+
+GLTFLoadedMesh loadDummyGLB(const char* path, uint32_t& outMaterialID) {
     cgltf_options options{};
     cgltf_data* data = nullptr;
-
-    if (cgltf_parse_file(&options, path, &data) != cgltf_result_success)
+    cgltf_result res = cgltf_parse_file(&options, path, &data);
+    if (res != cgltf_result_success) {
         throw std::runtime_error("Failed to parse glTF");
-
-    if (cgltf_load_buffers(&options, data, path) != cgltf_result_success) {
+    }
+    res = cgltf_load_buffers(&options, data, path);
+    if (res != cgltf_result_success) {
         cgltf_free(data);
         throw std::runtime_error("Failed to load glTF buffers");
     }
 
     if (data->meshes_count == 0) {
         cgltf_free(data);
-        throw std::runtime_error("glTF has no meshes");
+        throw std::runtime_error("dummy.glb has no meshes");
     }
 
-    cgltf_mesh* mesh = &data->meshes[0];
-    cgltf_primitive* prim = &mesh->primitives[0];
-
-    const cgltf_accessor* posAcc = nullptr;
-    const cgltf_accessor* normAcc = nullptr;
-    const cgltf_accessor* uvAcc = nullptr;
-
-    for (size_t i = 0; i < prim->attributes_count; ++i) {
-        cgltf_attribute* a = &prim->attributes[i];
-        if (a->type == cgltf_attribute_type_position) posAcc = a->data;
-        if (a->type == cgltf_attribute_type_normal)   normAcc = a->data;
-        if (a->type == cgltf_attribute_type_texcoord && a->index == 0) uvAcc = a->data;
-    }
-
-    if (!posAcc) {
+    cgltf_mesh& mesh = data->meshes[0];
+    if (mesh.primitives_count == 0) {
         cgltf_free(data);
-        throw std::runtime_error("glTF missing POSITION");
+        throw std::runtime_error("dummy.glb has no primitives");
     }
 
-    size_t vcount = posAcc->count;
-    gModelVertices.resize(vcount);
+    cgltf_primitive& prim = mesh.primitives[0];
 
-    float tmp[4];
-    for (size_t i = 0; i < vcount; ++i) {
-        cgltf_accessor_read_float(posAcc, i, tmp, 3);
-        gModelVertices[i].pos = { tmp[0],tmp[1],tmp[2] };
-
-        if (normAcc) {
-            cgltf_accessor_read_float(normAcc, i, tmp, 3);
-            gModelVertices[i].normal = { tmp[0],tmp[1],tmp[2] };
-        }
-        else {
-            gModelVertices[i].normal = { 0,1,0 };
-        }
-
-        if (uvAcc) {
-            cgltf_accessor_read_float(uvAcc, i, tmp, 2);
-            gModelVertices[i].uv = { tmp[0],tmp[1] };
-        }
-        else {
-            gModelVertices[i].uv = { 0,0 };
-        }
+    cgltf_accessor* posAcc = nullptr;
+    cgltf_accessor* normAcc = nullptr;
+    cgltf_accessor* uvAcc = nullptr;
+    for (size_t i = 0; i < prim.attributes_count; ++i) {
+        cgltf_attribute& a = prim.attributes[i];
+        if (a.type == cgltf_attribute_type_position) posAcc = a.data;
+        if (a.type == cgltf_attribute_type_normal)   normAcc = a.data;
+        if (a.type == cgltf_attribute_type_texcoord && a.index == 0) uvAcc = a.data;
+    }
+    if (!posAcc || !normAcc || !uvAcc || !prim.indices) {
+        cgltf_free(data);
+        throw std::runtime_error("dummy.glb missing pos/norm/uv/indices");
     }
 
-    gModelIndices.clear();
-    if (prim->indices) {
-        cgltf_accessor* idx = prim->indices;
-        gModelIndices.resize(idx->count);
-        for (size_t i = 0; i < idx->count; ++i)
-            gModelIndices[i] = (uint32_t)cgltf_accessor_read_index(idx, i);
-    }
-    else {
-        gModelIndices.resize(vcount);
-        for (size_t i = 0; i < vcount; ++i)
-            gModelIndices[i] = (uint32_t)i;
-    }
-
-    // Load base color texture
-    LoadedImage modelImg;
-
-    if (prim->material &&
-        prim->material->pbr_metallic_roughness.base_color_texture.texture) {
-
-        cgltf_texture* tex = prim->material->pbr_metallic_roughness.base_color_texture.texture;
-        cgltf_image* image = tex->image;
-
-        int w = 0, h = 0, c = 0;
-        stbi_uc* pixels = nullptr;
-
-        if (image->uri && image->uri[0] != '\0') {
-            pixels = stbi_load(image->uri, &w, &h, &c, STBI_rgb_alpha);
-        }
-        else if (image->buffer_view) {
-            cgltf_buffer_view* bv = image->buffer_view;
-            const unsigned char* start =
-                (const unsigned char*)bv->buffer->data + bv->offset;
-            pixels = stbi_load_from_memory(start, (int)bv->size, &w, &h, &c, STBI_rgb_alpha);
-        }
-
-        if (!pixels) {
-            cgltf_free(data);
-            throw std::runtime_error("Failed to load glTF texture");
-        }
-
-        modelImg.width = w;
-        modelImg.height = h;
-        modelImg.pixels.assign(pixels, pixels + (w * h * 4));
-        stbi_image_free(pixels);
-    }
-    else {
-        modelImg.width = 1;
-        modelImg.height = 1;
-        modelImg.pixels = { 255,255,255,255 };
-    }
-
-    createVulkanTextureFromRGBA(
-        modelImg,
-        gModelTexImage,
-        gModelTexMemory,
-        gModelTexView,
-        gModelTexSampler
-    );
-
-    // ------------------------------------------------------
-    // Build MorphMesh from glTF morph targets
-    // ------------------------------------------------------
-    gMorphMeshes.clear();
-    gMorphAnimation = MorphAnimation{};
-
-    if (prim->targets_count > 0) {
-        MorphMesh mm{};
-        mm.baseVertexOffset = 0; // will be adjusted after appendModelToGeometry
-        mm.vertexCount = (uint32_t)vcount;
-
-        mm.baseVertices = gModelVertices; // base mesh
-
-        mm.targets.resize(prim->targets_count);
-
-        for (size_t t = 0; t < prim->targets_count; ++t) {
-            MorphTarget& mt = mm.targets[t];
-
-            const cgltf_accessor* posDeltaAcc = nullptr;
-            const cgltf_accessor* normDeltaAcc = nullptr;
-
-            for (size_t a = 0; a < prim->targets[t].attributes_count; ++a) {
-                cgltf_attribute* attr = &prim->targets[t].attributes[a];
-                if (attr->type == cgltf_attribute_type_position)
-                    posDeltaAcc = attr->data;
-                if (attr->type == cgltf_attribute_type_normal)
-                    normDeltaAcc = attr->data;
-            }
-
-            mt.deltaPos.resize(vcount, glm::vec3(0.0f));
-            mt.deltaNormal.resize(vcount, glm::vec3(0.0f));
-
-            if (posDeltaAcc) {
-                for (size_t i = 0; i < vcount; ++i) {
-                    cgltf_accessor_read_float(posDeltaAcc, i, tmp, 3);
-                    mt.deltaPos[i] = glm::vec3(tmp[0], tmp[1], tmp[2]);
-                }
-            }
-
-            if (normDeltaAcc) {
-                for (size_t i = 0; i < vcount; ++i) {
-                    cgltf_accessor_read_float(normDeltaAcc, i, tmp, 3);
-                    mt.deltaNormal[i] = glm::vec3(tmp[0], tmp[1], tmp[2]);
-                }
-            }
-        }
-
-        mm.weights.resize(prim->targets_count, 0.0f);
-        gMorphMeshes.push_back(std::move(mm));
-    }
-
-    // ------------------------------------------------------
-    // Load morph weight animation (first animation, weights path)
-    // ------------------------------------------------------
-    if (data->animations_count > 0 && !gMorphMeshes.empty()) {
-        cgltf_animation* anim = &data->animations[0];
-
-        for (size_t c = 0; c < anim->channels_count; ++c) {
-            cgltf_animation_channel* ch = &anim->channels[c];
-            if (ch->target_path != cgltf_animation_path_type_weights)
-                continue;
-
-            cgltf_animation_sampler* s = ch->sampler;
-
-            cgltf_accessor* inAcc = s->input;
-            cgltf_accessor* outAcc = s->output;
-
-            size_t keyCount = inAcc->count;
-            size_t weightCountPerKey = outAcc->count / keyCount;
-
-            gMorphAnimation.sampler.times.resize(keyCount);
-            gMorphAnimation.sampler.weights.resize(keyCount);
-
-            for (size_t k = 0; k < keyCount; ++k) {
-                float tIn[4];
-                cgltf_accessor_read_float(inAcc, k, tIn, 1);
-                gMorphAnimation.sampler.times[k] = tIn[0];
-
-                gMorphAnimation.sampler.weights[k].resize(weightCountPerKey);
-                for (size_t w = 0; w < weightCountPerKey; ++w) {
-                    float wOut[4];
-                    cgltf_accessor_read_float(outAcc, k * weightCountPerKey + w, wOut, 1);
-                    gMorphAnimation.sampler.weights[k][w] = wOut[0];
-                }
-            }
-
-            if (!gMorphAnimation.sampler.times.empty())
-                gMorphAnimation.duration = gMorphAnimation.sampler.times.back();
-
-            break; // use first weights channel
-        }
-    }
-
-    cgltf_free(data);
-}
-
-void appendModelToGeometry() {
     uint32_t baseV = (uint32_t)gVertices.size();
     uint32_t baseI = (uint32_t)gIndices.size();
 
-    gVertices.insert(gVertices.end(), gModelVertices.begin(), gModelVertices.end());
-    for (auto idx : gModelIndices)
-        gIndices.push_back(baseV + idx);
+    size_t vCount = posAcc->count;
+    gVertices.resize(baseV + vCount);
 
-    RenderObject model{};
-    model.vertexOffset = baseV;
-    model.indexOffset = baseI;
-    model.indexCount = (uint32_t)gModelIndices.size();
-    model.materialID = 1; // model uses material 1
-    model.transform.position = { 0,5,0 };
-    model.transform.scale = { 0.01f,0.01f,0.01f };
+    auto readVec3 = [](cgltf_accessor* acc, size_t index) {
+        cgltf_float tmp[4];
+        cgltf_accessor_read_float(acc, index, tmp, 4);
+        return glm::vec3(tmp[0], tmp[1], tmp[2]);
+        };
+    auto readVec2 = [](cgltf_accessor* acc, size_t index) {
+        cgltf_float tmp[4];
+        cgltf_accessor_read_float(acc, index, tmp, 4);
+        return glm::vec2(tmp[0], tmp[1]);
+        };
 
-    gObjects.push_back(model);
-
-    // Fix MorphMesh baseVertexOffset now that model is appended
-    if (!gMorphMeshes.empty()) {
-        MorphMesh& mm = gMorphMeshes[0];
-        mm.baseVertexOffset = baseV;
-        mm.vertexCount = (uint32_t)gModelVertices.size();
-        mm.baseVertices = gModelVertices; // ensure base matches model
-    }
-}
-
-void createSharedBuffers() {
-    vk::DeviceSize vSize = sizeof(Vertex) * gVertices.size();
-    vk::DeviceSize iSize = sizeof(uint32_t) * gIndices.size();
-
-    createBuffer(
-        vSize,
-        vk::BufferUsageFlagBits::eVertexBuffer,
-        vk::MemoryPropertyFlagBits::eHostVisible |
-        vk::MemoryPropertyFlagBits::eHostCoherent,
-        gVertexBuffer, gVertexMemory
-    );
-
-    createBuffer(
-        iSize,
-        vk::BufferUsageFlagBits::eIndexBuffer,
-        vk::MemoryPropertyFlagBits::eHostVisible |
-        vk::MemoryPropertyFlagBits::eHostCoherent,
-        gIndexBuffer, gIndexMemory
-    );
-
-    void* data = gDevice.mapMemory(gVertexMemory, 0, vSize);
-    memcpy(data, gVertices.data(), (size_t)vSize);
-    gDevice.unmapMemory(gVertexMemory);
-
-    data = gDevice.mapMemory(gIndexMemory, 0, iSize);
-    memcpy(data, gIndices.data(), (size_t)iSize);
-    gDevice.unmapMemory(gIndexMemory);
-}
-// ======================= main.cpp  PART 6/9 =======================
-// Morph buffer, morph animation evaluation, UBOs, descriptor sets, command buffers, sync objects, UBO update
-
-void createMorphVertexBufferIfNeeded() {
-    if (gMorphBufferCreated)
-        return;
-
-    vk::DeviceSize vSize = sizeof(Vertex) * gVertices.size();
-
-    createBuffer(
-        vSize,
-        vk::BufferUsageFlagBits::eVertexBuffer,
-        vk::MemoryPropertyFlagBits::eHostVisible |
-        vk::MemoryPropertyFlagBits::eHostCoherent,
-        gMorphVertexBuffer,
-        gMorphVertexMemory
-    );
-
-    // Initialize morph buffer with base vertices
-    void* data = gDevice.mapMemory(gMorphVertexMemory, 0, vSize);
-    memcpy(data, gVertices.data(), (size_t)vSize);
-    gDevice.unmapMemory(gMorphVertexMemory);
-
-    gMorphBufferCreated = true;
-}
-
-// Evaluate morph animation sampler at time t (looped)
-void evaluateMorphAnimation(float timeSeconds, std::vector<float>& outWeights) {
-    if (gMorphAnimation.sampler.times.empty())
-        return;
-
-    float duration = gMorphAnimation.duration;
-    if (duration <= 0.0f)
-        duration = gMorphAnimation.sampler.times.back();
-
-    float t = fmodf(timeSeconds, duration);
-
-    const auto& times = gMorphAnimation.sampler.times;
-    const auto& weights = gMorphAnimation.sampler.weights;
-
-    if (t <= times.front()) {
-        outWeights = weights.front();
-        return;
-    }
-    if (t >= times.back()) {
-        outWeights = weights.back();
-        return;
+    for (size_t i = 0; i < vCount; ++i) {
+        glm::vec3 p = readVec3(posAcc, i);
+        glm::vec3 n = readVec3(normAcc, i);
+        glm::vec2 uv = readVec2(uvAcc, i);
+        gVertices[baseV + i] = { p, n, uv };
     }
 
-    size_t k1 = 0;
-    for (size_t i = 0; i < times.size() - 1; ++i) {
-        if (t >= times[i] && t <= times[i + 1]) {
-            k1 = i;
-            break;
-        }
+    size_t indexCount = prim.indices->count;
+    gIndices.resize(baseI + indexCount);
+    for (size_t i = 0; i < indexCount; ++i) {
+        gIndices[baseI + i] = (uint32_t)cgltf_accessor_read_index(prim.indices, i);
     }
 
-    size_t k2 = k1 + 1;
-    float t0 = times[k1];
-    float t1 = times[k2];
-    float alpha = (t - t0) / (t1 - t0);
+    // Material + texture (proper UV-based sampling)
+    vk::ImageView texView = gPlaneTexView;
+    vk::Sampler   texSampler = gPlaneTexSampler;
 
-    const auto& w0 = weights[k1];
-    const auto& w1 = weights[k2];
-
-    size_t count = std::min(w0.size(), w1.size());
-    outWeights.resize(count);
-
-    for (size_t i = 0; i < count; ++i) {
-        outWeights[i] = (1.0f - alpha) * w0[i] + alpha * w1[i];
-    }
-}
-
-void updateMorphMeshes(float timeSeconds) {
-    if (gMorphMeshes.empty())
-        return;
-
-    createMorphVertexBufferIfNeeded();
-
-    std::vector<Vertex> morphed = gVertices;
-
-    for (auto& mm : gMorphMeshes) {
-        if (mm.targets.empty())
-            continue;
-
-        // Evaluate animation weights for this mesh
-        std::vector<float> animWeights;
-        evaluateMorphAnimation(timeSeconds, animWeights);
-
-        // Clamp to number of targets
-        size_t targetCount = mm.targets.size();
-        mm.weights.assign(targetCount, 0.0f);
-        for (size_t i = 0; i < std::min(targetCount, animWeights.size()); ++i) {
-            mm.weights[i] = animWeights[i];
-        }
-
-        // Safety checks
-        assert(mm.baseVertexOffset + mm.vertexCount <= morphed.size());
-        assert(mm.baseVertices.size() == mm.vertexCount);
-
-        for (uint32_t i = 0; i < mm.vertexCount; ++i) {
-            Vertex v = mm.baseVertices[i];
-
-            glm::vec3 pos = v.pos;
-            glm::vec3 nrm = v.normal;
-
-            for (size_t t = 0; t < mm.targets.size(); ++t) {
-                float w = mm.weights[t];
-                if (w == 0.0f) continue;
-
-                const MorphTarget& mt = mm.targets[t];
-                assert(i < mt.deltaPos.size());
-                assert(i < mt.deltaNormal.size());
-
-                pos += mt.deltaPos[i] * w;
-                nrm += mt.deltaNormal[i] * w;
-            }
-
-            if (glm::length(nrm) > 0.0001f)
-                nrm = glm::normalize(nrm);
-
-            v.pos = pos;
-            v.normal = nrm;
-
-            morphed[mm.baseVertexOffset + i] = v;
-        }
-    }
-
-    vk::DeviceSize vSize = sizeof(Vertex) * morphed.size();
-    void* data = gDevice.mapMemory(gMorphVertexMemory, 0, vSize);
-    memcpy(data, morphed.data(), (size_t)vSize);
-    gDevice.unmapMemory(gMorphVertexMemory);
-}
-
-void createUBOs() {
-    size_t count = gSwapImages.size();
-    gUBOs.resize(count);
-    gUBOMem.resize(count);
-
-    for (size_t i = 0; i < count; ++i) {
-        vk::DeviceSize size = sizeof(GlobalUBO);
-
-        createBuffer(
-            size,
-            vk::BufferUsageFlagBits::eUniformBuffer,
-            vk::MemoryPropertyFlagBits::eHostVisible |
-            vk::MemoryPropertyFlagBits::eHostCoherent,
-            gUBOs[i],
-            gUBOMem[i]
-        );
-    }
-}
-
-void createDescriptorSets() {
-    size_t count = gSwapImages.size();
-
-    std::array<vk::DescriptorPoolSize, 2> poolSizes{};
-    poolSizes[0].type = vk::DescriptorType::eUniformBuffer;
-    poolSizes[0].descriptorCount = (uint32_t)count;
-    poolSizes[1].type = vk::DescriptorType::eCombinedImageSampler;
-    poolSizes[1].descriptorCount = (uint32_t)count;
-
-    vk::DescriptorPoolCreateInfo pi{};
-    pi.maxSets = (uint32_t)count;
-    pi.poolSizeCount = (uint32_t)poolSizes.size();
-    pi.pPoolSizes = poolSizes.data();
-
-    gDescPool = gDevice.createDescriptorPool(pi);
-
-    std::vector<vk::DescriptorSetLayout> layouts(count, gDescSetLayout);
-    vk::DescriptorSetAllocateInfo ai{};
-    ai.descriptorPool = gDescPool;
-    ai.descriptorSetCount = (uint32_t)count;
-    ai.pSetLayouts = layouts.data();
-
-    gGlobalDescSets = gDevice.allocateDescriptorSets(ai);
-
-    for (size_t i = 0; i < count; ++i) {
-        vk::DescriptorBufferInfo bi{};
-        bi.buffer = gUBOs[i];
-        bi.offset = 0;
-        bi.range = sizeof(GlobalUBO);
-
-        vk::WriteDescriptorSet write{};
-        write.dstSet = gGlobalDescSets[i];
-        write.dstBinding = 0;
-        write.descriptorCount = 1;
-        write.descriptorType = vk::DescriptorType::eUniformBuffer;
-        write.pBufferInfo = &bi;
-
-        gDevice.updateDescriptorSets(1, &write, 0, nullptr);
-    }
-}
-
-void createCommandBuffers() {
-    gCmdBuffers.resize(gFramebuffers.size());
-
-    vk::CommandBufferAllocateInfo ai{};
-    ai.commandPool = gCmdPool;
-    ai.level = vk::CommandBufferLevel::ePrimary;
-    ai.commandBufferCount = (uint32_t)gCmdBuffers.size();
-
-    gCmdBuffers = gDevice.allocateCommandBuffers(ai);
-
-    for (size_t i = 0; i < gCmdBuffers.size(); ++i) {
-        vk::CommandBuffer cmd = gCmdBuffers[i];
-
-        vk::CommandBufferBeginInfo bi{};
-        cmd.begin(bi);
-
-        std::array<vk::ClearValue, 2> clears{};
-        clears[0].color = vk::ClearColorValue(std::array<float, 4>{0.1f, 0.1f, 0.15f, 1.0f});
-        clears[1].depthStencil = vk::ClearDepthStencilValue(1.0f, 0);
-
-        vk::RenderPassBeginInfo rp{};
-        rp.renderPass = gRenderPass;
-        rp.framebuffer = gFramebuffers[i];
-        rp.renderArea.offset = vk::Offset2D(0, 0);
-        rp.renderArea.extent = gSwapExtent;
-        rp.clearValueCount = (uint32_t)clears.size();
-        rp.pClearValues = clears.data();
-
-        cmd.beginRenderPass(rp, vk::SubpassContents::eInline);
-        cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, gPipeline);
-
-        cmd.bindIndexBuffer(gIndexBuffer, 0, vk::IndexType::eUint32);
-
-        cmd.bindDescriptorSets(
-            vk::PipelineBindPoint::eGraphics,
-            gPipelineLayout,
-            0,
-            gGlobalDescSets[i],
-            nullptr
-        );
-
-        for (size_t objIndex = 0; objIndex < gObjects.size(); ++objIndex) {
-            const RenderObject& obj = gObjects[objIndex];
-
-            // materialID == 1 -> model -> morph buffer
-            // else -> static vertex buffer
-            vk::Buffer vb = gVertexBuffer;
-            if (obj.materialID == 1 && gMorphBufferCreated) {
-                vb = gMorphVertexBuffer;
-            }
-
-            vk::DeviceSize offs = 0;
-            cmd.bindVertexBuffers(0, vb, offs);
-
-            PushConstants pc{};
-            pc.model = obj.transform.toMatrix();
-            pc.objectID = (int)objIndex;
-            pc.roughnessOverride = 1.0f;
-            pc.metallicOverride = 0.0f;
-
-            cmd.pushConstants(
-                gPipelineLayout,
-                vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment,
-                0,
-                sizeof(PushConstants),
-                &pc
+    if (prim.material && prim.material->pbr_metallic_roughness.base_color_texture.texture) {
+        cgltf_texture* tex = prim.material->pbr_metallic_roughness.base_color_texture.texture;
+        if (tex->image) {
+            LoadedImage img = loadImageFromCgltfImage(tex->image, path);
+            createVulkanTextureFromRGBA(
+                img,
+                gDummyTexImage,
+                gDummyTexMemory,
+                gDummyTexView,
+                gDummyTexSampler
             );
-
-            const Material& mat = gMaterials[obj.materialID];
-
-            vk::DescriptorImageInfo ii{};
-            ii.sampler = mat.sampler;
-            ii.imageView = mat.view;
-            ii.imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal;
-
-            vk::WriteDescriptorSet write{};
-            write.dstSet = gGlobalDescSets[i];
-            write.dstBinding = 1;
-            write.descriptorCount = 1;
-            write.descriptorType = vk::DescriptorType::eCombinedImageSampler;
-            write.pImageInfo = &ii;
-
-            gDevice.updateDescriptorSets(1, &write, 0, nullptr);
-
-            cmd.bindDescriptorSets(
-                vk::PipelineBindPoint::eGraphics,
-                gPipelineLayout,
-                0,
-                gGlobalDescSets[i],
-                nullptr
-            );
-
-            cmd.drawIndexed(obj.indexCount, 1, obj.indexOffset, 0, 0);
+            texView = gDummyTexView;
+            texSampler = gDummyTexSampler;
         }
-
-        cmd.endRenderPass();
-        cmd.end();
-    }
-}
-
-void createSyncObjects() {
-    vk::SemaphoreCreateInfo si{};
-    gImgAvailable = gDevice.createSemaphore(si);
-    gRenderFinished = gDevice.createSemaphore(si);
-
-    vk::FenceCreateInfo fi{};
-    fi.flags = vk::FenceCreateFlagBits::eSignaled;
-    gInFlight = gDevice.createFence(fi);
-}
-
-void updateUBO(uint32_t imageIndex) {
-    GlobalUBO ubo{};
-
-    ubo.view = gCamera.getView();
-    ubo.proj = glm::perspective(
-        glm::radians(60.0f),
-        gSwapExtent.width / (float)gSwapExtent.height,
-        0.1f, 500.0f
-    );
-    ubo.proj[1][1] *= -1.0f;
-
-    glm::vec3 lightDir = glm::normalize(glm::vec3(-0.5f, -1.0f, -0.3f));
-    ubo.lightDir = glm::vec4(lightDir, 0.0f);
-    ubo.lightColor = glm::vec4(3.0f, 2.6f, 2.2f, 1.0f);
-
-    void* data = gDevice.mapMemory(gUBOMem[imageIndex], 0, sizeof(GlobalUBO));
-    memcpy(data, &ubo, sizeof(GlobalUBO));
-    gDevice.unmapMemory(gUBOMem[imageIndex]);
-}
-// ======================= main.cpp  PART 7/9 =======================
-// Input system: keyboard, mouse, controller
-
-void processKeyboard(float dt) {
-    if (!gWindow) return;
-
-    const float velocity = gCamera.speed * dt;
-
-    auto forward = [&]() {
-        glm::vec3 front;
-        front.x = cos(glm::radians(gCamera.yaw)) * cos(glm::radians(gCamera.pitch));
-        front.y = sin(glm::radians(gCamera.pitch));
-        front.z = sin(glm::radians(gCamera.yaw)) * cos(glm::radians(gCamera.pitch));
-        return glm::normalize(front);
-        };
-
-    glm::vec3 f = forward();
-    glm::vec3 right = glm::normalize(glm::cross(f, glm::vec3(0, 1, 0)));
-
-    if (glfwGetKey(gWindow, GLFW_KEY_W) == GLFW_PRESS) gCamera.position += f * velocity;
-    if (glfwGetKey(gWindow, GLFW_KEY_S) == GLFW_PRESS) gCamera.position -= f * velocity;
-    if (glfwGetKey(gWindow, GLFW_KEY_A) == GLFW_PRESS) gCamera.position -= right * velocity;
-    if (glfwGetKey(gWindow, GLFW_KEY_D) == GLFW_PRESS) gCamera.position += right * velocity;
-}
-
-void processController(float dt) {
-    if (!gWindow) return;
-
-    if (!glfwJoystickIsGamepad(GLFW_JOYSTICK_1))
-        return;
-
-    GLFWgamepadstate state{};
-    if (!glfwGetGamepadState(GLFW_JOYSTICK_1, &state))
-        return;
-
-    const float velocity = gCamera.speed * dt;
-
-    auto forward = [&]() {
-        glm::vec3 front;
-        front.x = cos(glm::radians(gCamera.yaw)) * cos(glm::radians(gCamera.pitch));
-        front.y = sin(glm::radians(gCamera.pitch));
-        front.z = sin(glm::radians(gCamera.yaw)) * cos(glm::radians(gCamera.pitch));
-        return glm::normalize(front);
-        };
-
-    glm::vec3 f = forward();
-    glm::vec3 right = glm::normalize(glm::cross(f, glm::vec3(0, 1, 0)));
-
-    float lx = state.axes[GLFW_GAMEPAD_AXIS_LEFT_X];
-    float ly = state.axes[GLFW_GAMEPAD_AXIS_LEFT_Y];
-    float rx = state.axes[GLFW_GAMEPAD_AXIS_RIGHT_X];
-    float ry = state.axes[GLFW_GAMEPAD_AXIS_RIGHT_Y];
-
-    auto deadzone = [](float v, float dz) {
-        return (std::fabs(v) < dz) ? 0.0f : v;
-        };
-
-    lx = deadzone(lx, 0.15f);
-    ly = deadzone(ly, 0.15f);
-    rx = deadzone(rx, 0.15f);
-    ry = deadzone(ry, 0.15f);
-
-    gCamera.position += f * (-ly * velocity);
-    gCamera.position += right * (lx * velocity);
-
-    float lookScale = gCamera.sensitivity * 100.0f * dt;
-    gCamera.yaw += rx * lookScale;
-    gCamera.pitch -= ry * lookScale;
-
-    if (gCamera.pitch > 89.0f)  gCamera.pitch = 89.0f;
-    if (gCamera.pitch < -89.0f) gCamera.pitch = -89.0f;
-}
-
-void mouseCallback(GLFWwindow* window, double xpos, double ypos) {
-    if (gFirstMouse) {
-        gLastX = xpos;
-        gLastY = ypos;
-        gFirstMouse = false;
     }
 
-    float xoffset = float(xpos - gLastX);
-    float yoffset = float(gLastY - ypos);
-    gLastX = xpos;
-    gLastY = ypos;
+    outMaterialID = (uint32_t)gMaterials.size();
+    gMaterials.push_back(Material{ texView, texSampler });
 
-    xoffset *= gCamera.sensitivity;
-    yoffset *= gCamera.sensitivity;
+    GLTFLoadedMesh result{};
+    result.vertexOffset = baseV;
+    result.indexOffset = baseI;
+    result.indexCount = (uint32_t)indexCount;
 
-    gCamera.yaw += xoffset;
-    gCamera.pitch += yoffset;
-
-    if (gCamera.pitch > 89.0f)  gCamera.pitch = 89.0f;
-    if (gCamera.pitch < -89.0f) gCamera.pitch = -89.0f;
+    cgltf_free(data);
+    return result;
 }
 
-void setupInput() {
-    glfwSetCursorPosCallback(gWindow, mouseCallback);
-    glfwSetInputMode(gWindow, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
-}
-// ======================= main.cpp  PART 8/9 =======================
-// Frame rendering and main loop
-
-void drawFrame() {
-    gDevice.waitForFences(gInFlight, VK_TRUE, UINT64_MAX);
-    gDevice.resetFences(gInFlight);
-
-    uint32_t imageIndex =
-        gDevice.acquireNextImageKHR(
-            gSwapchain,
-            UINT64_MAX,
-            gImgAvailable,
-            {}
-        ).value;
-
-    updateUBO(imageIndex);
-
-    vk::PipelineStageFlags waitStage =
-        vk::PipelineStageFlagBits::eColorAttachmentOutput;
-
-    vk::SubmitInfo si{};
-    si.waitSemaphoreCount = 1;
-    si.pWaitSemaphores = &gImgAvailable;
-    si.pWaitDstStageMask = &waitStage;
-    si.commandBufferCount = 1;
-    si.pCommandBuffers = &gCmdBuffers[imageIndex];
-    si.signalSemaphoreCount = 1;
-    si.pSignalSemaphores = &gRenderFinished;
-
-    gGraphicsQueue.submit(si, gInFlight);
-
-    vk::PresentInfoKHR pi{};
-    pi.waitSemaphoreCount = 1;
-    pi.pWaitSemaphores = &gRenderFinished;
-    pi.swapchainCount = 1;
-    pi.pSwapchains = &gSwapchain;
-    pi.pImageIndices = &imageIndex;
-
-    gGraphicsQueue.presentKHR(pi);
-}
-
-float getDeltaTime() {
-    auto now = std::chrono::steady_clock::now();
-
-    if (gLastFrameTime.time_since_epoch().count() == 0) {
-        gLastFrameTime = now;
-        return 0.0f;
-    }
-
-    float dt = std::chrono::duration<float>(now - gLastFrameTime).count();
-    gLastFrameTime = now;
-    return dt;
-}
-
-void mainLoop() {
-    gLastFrameTime = std::chrono::steady_clock::now();
-    static float morphTime = 0.0f;
-
-    while (!glfwWindowShouldClose(gWindow)) {
-        glfwPollEvents();
-
-        float dt = getDeltaTime();
-
-        processKeyboard(dt);
-        processController(dt);
-
-        morphTime += dt;
-        updateMorphMeshes(morphTime);  // real glTF morph animation
-
-        drawFrame();
-    }
-
-    gDevice.waitIdle();
-}
-// ======================= main.cpp  PART 9/9 =======================
-// Initialization, cleanup, entry point
-
-void loadPlaneTexture(const char* path) {
-    int w = 0, h = 0, c = 0;
-    stbi_uc* pixels = stbi_load(path, &w, &h, &c, STBI_rgb_alpha);
-    if (!pixels)
-        throw std::runtime_error("Failed to load plane texture");
-
-    LoadedImage img;
-    img.width = w;
-    img.height = h;
-    img.pixels.assign(pixels, pixels + (w * h * 4));
-    stbi_image_free(pixels);
-
-    createVulkanTextureFromRGBA(
-        img,
-        gPlaneTexImage,
-        gPlaneTexMemory,
-        gPlaneTexView,
-        gPlaneTexSampler
-    );
-}
-
-void initVulkan() {
-    createInstance();
-    createSurface();
-    pickGPU();
-    createDevice();
-    createSwapchain();
-    createDepthResources();
-    createRenderPass();
-    createFramebuffers();
-    createDescriptorSetLayout();
-    createPipelineLayout();
-    createPipeline();
-    createCommandPool();
-
-    loadPlaneTexture("grid.png");
-    loadGLTFModel("dummy.glb");
-
-    gMaterials.clear();
-    gMaterials.push_back({ gPlaneTexView, gPlaneTexSampler }); // material 0
-    gMaterials.push_back({ gModelTexView, gModelTexSampler }); // material 1
-
-    addPlaneAndCubeGeometry();
-    appendModelToGeometry();
-
-    createSharedBuffers();
-    createMorphVertexBufferIfNeeded();
-
-    createUBOs();
-    createDescriptorSets();
-
-    createCommandBuffers();
-    createSyncObjects();
-}
-
-void cleanup() {
-    gDevice.waitIdle();
-
-    gDevice.destroyFence(gInFlight);
-    gDevice.destroySemaphore(gRenderFinished);
-    gDevice.destroySemaphore(gImgAvailable);
-
-    if (gMorphBufferCreated) {
-        gDevice.destroyBuffer(gMorphVertexBuffer);
-        gDevice.freeMemory(gMorphVertexMemory);
-    }
-
-    gDevice.destroyBuffer(gVertexBuffer);
-    gDevice.freeMemory(gVertexMemory);
-    gDevice.destroyBuffer(gIndexBuffer);
-    gDevice.freeMemory(gIndexMemory);
-
-    for (size_t i = 0; i < gUBOs.size(); ++i) {
-        gDevice.destroyBuffer(gUBOs[i]);
-        gDevice.freeMemory(gUBOMem[i]);
-    }
-
-    gDevice.destroySampler(gPlaneTexSampler);
-    gDevice.destroyImageView(gPlaneTexView);
-    gDevice.destroyImage(gPlaneTexImage);
-    gDevice.freeMemory(gPlaneTexMemory);
-
-    gDevice.destroySampler(gModelTexSampler);
-    gDevice.destroyImageView(gModelTexView);
-    gDevice.destroyImage(gModelTexImage);
-    gDevice.freeMemory(gModelTexMemory);
-
-    gDevice.destroyImageView(gDepthView);
-    gDevice.destroyImage(gDepthImage);
-    gDevice.freeMemory(gDepthMemory);
-
-    for (auto fb : gFramebuffers)
-        gDevice.destroyFramebuffer(fb);
-
-    gDevice.destroyRenderPass(gRenderPass);
-
-    for (auto v : gSwapViews)
-        gDevice.destroyImageView(v);
-
-    gDevice.destroySwapchainKHR(gSwapchain);
-
-    gDevice.destroyDescriptorPool(gDescPool);
-    gDevice.destroyDescriptorSetLayout(gDescSetLayout);
-
-    gDevice.destroyPipeline(gPipeline);
-    gDevice.destroyPipelineLayout(gPipelineLayout);
-
-    gDevice.destroyCommandPool(gCmdPool);
-
-    gDevice.destroy();
-    gInstance.destroySurfaceKHR(gSurface);
-    gInstance.destroy();
-
-    glfwDestroyWindow(gWindow);
-    glfwTerminate();
-}
+// ----------------------------------------------------------
+// Main
+// ----------------------------------------------------------
 
 int main() {
     try {
         initWindow();
-        initVulkan();
-        setupInput();
-        mainLoop();
-        cleanup();
+        createInstance();
+        createSurface();
+        pickGPU();
+        createDevice();
+        createSwapchain();
+        createDepthResources();
+        createRenderPass();
+        createDescriptorSetLayout();
+        createPipelineLayout();
+        createPipeline();
+        createFramebuffers();
+        createCommandPool();
+        allocateCommandBuffers();
+        createSyncObjects();
+        createUBOs();
+        createDescriptorPoolAndSets();
+
+        // Load grid.png for plane/cube
+        LoadedImage gridImg = loadPNG("grid.png");
+        createVulkanTextureFromRGBA(
+            gridImg,
+            gPlaneTexImage,
+            gPlaneTexMemory,
+            gPlaneTexView,
+            gPlaneTexSampler
+        );
+        uint32_t gridMatID = (uint32_t)gMaterials.size();
+        gMaterials.push_back(Material{ gPlaneTexView, gPlaneTexSampler });
+
+        // Geometry: plane + cube (separate ranges)
+        MeshRange planeRange{}, cubeRange{};
+        addPlaneAndCubeGeometry(planeRange, cubeRange);
+
+        // Load dummy.glb (appends vertices/indices, creates its own sampler if texture present)
+        uint32_t dummyMatID = 0;
+        GLTFLoadedMesh dummyMesh = loadDummyGLB("dummy.glb", dummyMatID);
+
+        // Upload combined buffers
+        uploadSharedBuffers();
+
+        // Init UBO descriptors (binding 0 only)
+        initUBODescriptorSets();
+
+        // ECS setup
+        ECSRegistry   reg;
+        ECSComponents comps;
+
+        // Camera entity
+        Entity cam = ecsCreateEntity(reg);
+        TransformComponent camT{};
+        camT.position = glm::vec3(0.0f, 8.0f, -25.0f);
+        CameraComponent camC{};
+        camC.pitch = -10.0f;
+        camC.yaw = 90.0f;
+        camC.fov = 60.0f;
+        camC.speed = 10.0f;
+        camC.sensitivity = 0.1f;
+        InputComponent camInput{};
+
+        comps.transforms.add(cam, camT);
+        comps.cameras.add(cam, camC);
+        comps.inputs.add(cam, camInput);
+
+        // Plane entity (grid.png)
+        Entity planeE = ecsCreateEntity(reg);
+        TransformComponent planeT{};
+        planeT.position = glm::vec3(0.0f);
+        planeT.scale = glm::vec3(1.0f);
+        MeshComponent planeM{};
+        planeM.vertexOffset = planeRange.vertexOffset;
+        planeM.indexOffset = planeRange.indexOffset;
+        planeM.indexCount = planeRange.indexCount;
+        planeM.materialID = gridMatID;
+        MaterialComponent planeMat{};
+        planeMat.materialID = gridMatID;
+
+        comps.transforms.add(planeE, planeT);
+        comps.meshes.add(planeE, planeM);
+        comps.materials.add(planeE, planeMat);
+
+        // Cube entity (grid.png)
+        Entity cubeE = ecsCreateEntity(reg);
+        TransformComponent cubeT{};
+        cubeT.position = glm::vec3(0.0f, 0.0f, 0.0f);
+        cubeT.scale = glm::vec3(1.0f);
+        MeshComponent cubeM{};
+        cubeM.vertexOffset = cubeRange.vertexOffset;
+        cubeM.indexOffset = cubeRange.indexOffset;
+        cubeM.indexCount = cubeRange.indexCount;
+        cubeM.materialID = gridMatID;
+        MaterialComponent cubeMat{};
+        cubeMat.materialID = gridMatID;
+
+        comps.transforms.add(cubeE, cubeT);
+        comps.meshes.add(cubeE, cubeM);
+        comps.materials.add(cubeE, cubeMat);
+
+        // dummy.glb entity (its own texture) -- use small scale and position similar to working main
+        Entity dummyE = ecsCreateEntity(reg);
+        TransformComponent dummyT{};
+        dummyT.position = glm::vec3(0.0f, 5.0f, 0.0f);   // place above ground
+        dummyT.scale = glm::vec3(0.01f, 0.01f, 0.01f);   // scale down to match glTF units
+        MeshComponent dummyMC{};
+        dummyMC.vertexOffset = dummyMesh.vertexOffset;
+        dummyMC.indexOffset = dummyMesh.indexOffset;
+        dummyMC.indexCount = dummyMesh.indexCount;
+        dummyMC.materialID = dummyMatID;
+        MaterialComponent dummyMatC{};
+        dummyMatC.materialID = dummyMatID;
+
+        comps.transforms.add(dummyE, dummyT);
+        comps.meshes.add(dummyE, dummyMC);
+        comps.materials.add(dummyE, dummyMatC);
+
+        gLastFrameTime = std::chrono::steady_clock::now();
+
+        while (!glfwWindowShouldClose(gWindow)) {
+            glfwPollEvents();
+
+            auto now = std::chrono::steady_clock::now();
+            float dt = std::chrono::duration<float>(now - gLastFrameTime).count();
+            gLastFrameTime = now;
+
+            updateInputSystem(reg, comps, dt);
+            renderFrame(reg, comps);
+        }
+
+        gDevice.waitIdle();
+        std::cout << "Shutdown clean.\n";
+
+        // Cleanup
+        gDevice.destroyFence(gInFlight);
+        gDevice.destroySemaphore(gRenderFinished);
+        gDevice.destroySemaphore(gImgAvailable);
+
+        for (size_t i = 0; i < gUBOs.size(); ++i) {
+            gDevice.destroyBuffer(gUBOs[i]);
+            gDevice.freeMemory(gUBOMem[i]);
+        }
+
+        gDevice.destroySampler(gPlaneTexSampler);
+        gDevice.destroyImageView(gPlaneTexView);
+        gDevice.destroyImage(gPlaneTexImage);
+        gDevice.freeMemory(gPlaneTexMemory);
+
+        gDevice.destroySampler(gDummyTexSampler);
+        gDevice.destroyImageView(gDummyTexView);
+        gDevice.destroyImage(gDummyTexImage);
+        gDevice.freeMemory(gDummyTexMemory);
+
+        gDevice.destroyBuffer(gVertexBuffer);
+        gDevice.freeMemory(gVertexMemory);
+        gDevice.destroyBuffer(gIndexBuffer);
+        gDevice.freeMemory(gIndexMemory);
+
+        gDevice.destroyImageView(gDepthView);
+        gDevice.destroyImage(gDepthImage);
+        gDevice.freeMemory(gDepthMemory);
+
+        for (auto fb : gFramebuffers) gDevice.destroyFramebuffer(fb);
+        gDevice.destroyRenderPass(gRenderPass);
+        for (auto v : gSwapViews) gDevice.destroyImageView(v);
+        gDevice.destroySwapchainKHR(gSwapchain);
+
+        gDevice.destroyDescriptorPool(gDescPool);
+        gDevice.destroyDescriptorSetLayout(gDescSetLayout);
+
+        gDevice.destroyPipeline(gPipeline);
+        gDevice.destroyPipelineLayout(gPipelineLayout);
+
+        gDevice.destroyCommandPool(gCmdPool);
+
+        gDevice.destroy();
+        gInstance.destroySurfaceKHR(gSurface);
+        gInstance.destroy();
+
+        glfwDestroyWindow(gWindow);
+        glfwTerminate();
     }
     catch (const std::exception& e) {
-        std::cerr << "Fatal error: " << e.what() << std::endl;
-        return EXIT_FAILURE;
+        std::cerr << "Fatal: " << e.what() << "\n";
+        return -1;
     }
 
-    return EXIT_SUCCESS;
+    return 0;
 }
